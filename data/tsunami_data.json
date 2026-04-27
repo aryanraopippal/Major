@@ -1,0 +1,7 @@
+[
+  {"name": "Okinawa Coast", "lat": 26.2, "lon": 127.7, "risk": 8.5},
+  {"name": "Taiwan East Coast", "lat": 24.0, "lon": 121.9, "risk": 9.1},
+  {"name": "Philippines Coast", "lat": 13.0, "lon": 122.0, "risk": 7.8},
+  {"name": "Japan Pacific Coast", "lat": 35.0, "lon": 140.0, "risk": 9.5},
+  {"name": "Indonesia Coast", "lat": -2.5, "lon": 120.0, "risk": 8.9}
+]

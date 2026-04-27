@@ -1,0 +1,7 @@
+[
+  {"name": "Ganga Basin", "lat": 25.3, "lon": 82.9, "risk": 8.2},
+  {"name": "Brahmaputra Region", "lat": 26.2, "lon": 91.7, "risk": 9.0},
+  {"name": "Mumbai Region", "lat": 19.0, "lon": 72.8, "risk": 7.5},
+  {"name": "Chennai Region", "lat": 13.0, "lon": 80.2, "risk": 8.1},
+  {"name": "Kerala Region", "lat": 10.0, "lon": 76.2, "risk": 8.7}
+]
