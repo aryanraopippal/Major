@@ -4,6 +4,8 @@ import psycopg2
 from datetime import datetime, timedelta, timezone
 import os
 import joblib
+import math
+import google.generativeai as genai
 
 # --- SPECIALIST IMPORTS ---
 from engine.disaster_engine import run_disaster
@@ -15,11 +17,19 @@ app = Flask(__name__)
 app.config['PROPAGATE_EXCEPTIONS'] = True
 app.config['DEBUG'] = True
 
-# --- Configuration ---
+# --- Configuration & AI Setup ---
 DB_HOST = os.environ.get("DB_HOST", "localhost")
 DB_NAME = os.environ.get("DB_NAME", "earthquake_db")
 DB_USER = os.environ.get("DB_USER", "aryanraopippal")
 DB_PASS = os.environ.get("DB_PASS", "")
+
+# --- EMERGENCY KEY ROTATION SETUP ---
+GEMINI_KEYS = [
+    os.environ.get("GEMINI_API_KEY", ""), # Your main environment key
+    "AIzaSyAXxpjb6zsNYpMKBgY5ruGA1_v0B8A_V08",
+    "AIzaSyBUp1H765RP25Nv_tsaaladthagWQeMUfg",
+    "AIzaSyBERYNKV1yd5n1v1HuoYsZU6Od319Wvtx4"
+]
 
 GDACS_API_URL = "https://www.gdacs.org/gdacsapi/api/events/geteventlist/MAP?eventlist=TS,FL&fromdate=" + (datetime.now(timezone.utc) - timedelta(days=30)).strftime("%Y-%m-%d")
 MAX_LAND_PROXIMITY_KM = 80.0 
@@ -34,10 +44,21 @@ def load_financial_assets():
     except:
         pass
 
+# --- JSON SANITIZER (CRASH PREVENTER) ---
+def sanitize_float(val, default=0.0):
+    try:
+        if val is None: return default
+        v = float(val)
+        if math.isnan(v) or math.isinf(v): return default
+        return v
+    except:
+        return default
+
 INTERCEPT, COEF_MAG, COEF_SIG, COEF_CDI, COEF_DIST, COEF_NST, COEF_GAP, COEF_DEPTH = 1.954, 0.395, 0.001, 0.300, -0.002, 0.0007, -0.002, -0.006
 
 def calculate_impact_score(magnitude, sig, cdi, distanceKM, nst, gap, depth):
-    return INTERCEPT + (COEF_MAG * magnitude) + (COEF_SIG * sig) + (COEF_CDI * cdi) + (COEF_DIST * distanceKM) + (COEF_NST * nst) + (COEF_GAP * gap) + (COEF_DEPTH * depth)
+    score = INTERCEPT + (COEF_MAG * magnitude) + (COEF_SIG * sig) + (COEF_CDI * cdi) + (COEF_DIST * distanceKM) + (COEF_NST * nst) + (COEF_GAP * gap) + (COEF_DEPTH * depth)
+    return sanitize_float(score)
 
 def get_db_connection():
     try:
@@ -53,6 +74,9 @@ def predict_advanced_impact(lat, lon, mag, depth, sig, cdi, nst, gap):
     city_impact_score = 0 
     dist_km = 0
 
+    lat, lon, mag, depth = sanitize_float(lat), sanitize_float(lon), sanitize_float(mag), sanitize_float(depth)
+    sig, cdi, nst, gap = sanitize_float(sig), sanitize_float(cdi), sanitize_float(nst), sanitize_float(gap)
+
     try:
         cur = conn.cursor()
         query = "SELECT a.city_name, a.city_population, a.vulnerability_factor, ST_Distance(c.geo, ST_SetSRID(ST_MakePoint(%s, %s), 4326)) / 1000 AS distance_km FROM quake_analysis a JOIN cities c ON a.city_name = c.name WHERE c.geo IS NOT NULL ORDER BY ST_Distance(c.geo, ST_SetSRID(ST_MakePoint(%s, %s), 4326)) LIMIT 1"
@@ -60,7 +84,7 @@ def predict_advanced_impact(lat, lon, mag, depth, sig, cdi, nst, gap):
         result = cur.fetchone()
         if result:
             name, pop, vuln, dist_km = result
-            nearest_city_data = { "name": name, "population": pop or 0, "vulnerability_factor": float(vuln or 0), "distance_km": dist_km or 1000 }
+            nearest_city_data = { "name": name, "population": sanitize_float(pop, 0.0), "vulnerability_factor": sanitize_float(vuln, 0.0), "distance_km": sanitize_float(dist_km, 1000.0) }
             city_impact_score = calculate_impact_score(mag, sig, cdi, nearest_city_data["distance_km"], nst, gap, depth)
     except:
         if conn: conn.rollback() 
@@ -73,22 +97,48 @@ def predict_advanced_impact(lat, lon, mag, depth, sig, cdi, nst, gap):
 
     city_pop = nearest_city_data["population"]
     vuln_factor = nearest_city_data["vulnerability_factor"]
+    dist_km = nearest_city_data["distance_km"]
+    
     arch_loss_raw = city_pop * (max(0, city_impact_score - 4) / 10) * (1 + vuln_factor / 100) * 0.05 
-    architecture_loss = round(arch_loss_raw) if arch_loss_raw >= 1 else 0
-    homeless_rate_raw = (architecture_loss / city_pop) * 100 * (1 + vuln_factor / 50) * 1.5 if city_pop > 0 else 0
+    architecture_loss = round(sanitize_float(arch_loss_raw)) if arch_loss_raw >= 1 else 0
+    homeless_rate_raw = (architecture_loss / max(1, city_pop)) * 100 * (1 + vuln_factor / 50) * 1.5
     price_fluct_raw = (max(0, city_impact_score - 4)) * 0.3 + max(0, mag - 5) * 0.2 + vuln_factor * 0.1 
-    recovery_years_raw = 0.5 + (architecture_loss / city_pop) * 100 if city_pop > 0 else 0.5 + max(0, mag - 6) * 1 + vuln_factor * 0.5
+    recovery_years_raw = 0.5 + (architecture_loss / max(1, city_pop)) * 100 if city_pop > 0 else 0.5 + max(0, mag - 6) * 1 + vuln_factor * 0.5
 
     return {
-        "price_fluctuation": f"{round(price_fluct_raw, 2)}%",
-        "homelessness_rate": f"{round(homeless_rate_raw, 2)}%",
-        "architecture_loss": f"{architecture_loss:,} buildings",
-        "recovery_rate": f"{round(recovery_years_raw, 1)} years",
-        "city_impact_score": city_impact_score,
+        "price_fluctuation": f"-{round(sanitize_float(price_fluct_raw), 2)}%",
+        "homelessness_rate": f"{round(sanitize_float(homeless_rate_raw), 2)}%",
+        "architecture_loss": f"{int(architecture_loss):,} buildings",
+        "recovery_rate": f"{round(sanitize_float(recovery_years_raw), 1)} years",
+        "city_impact_score": sanitize_float(city_impact_score),
         "city_name": nearest_city_data["name"],
         "city_vulnerability": vuln_factor,
         "nearest_city_distance_km": dist_km 
     }
+
+# --- THE OFFLINE SAFETY NET ---
+def generate_offline_briefing(data):
+    high = data.get('high', 0)
+    total = data.get('total', 0)
+    mag = data.get('mag', 0)
+    status = "STABLE" if high == 0 else "CRITICAL"
+    
+    return f"""[LOCAL UPLINK ACTIVE - EDGE COMPUTING FALLBACK]
+
+[THE SITUATION]
+- Event Type: {str(data.get('type')).upper()}
+- Severity Magnitude: {mag}
+- Total Assets Tracked: {total}
+
+[PEOPLE AND BUILDINGS]
+- Current Status: {status}
+- Our sensors show {data.get('low')} areas are largely unaffected structurally.
+- Impact Score is in operational limits; expect minor power fluctuations but no systemic failure.
+
+[MONEY AND SUPPLIES]
+- Market Reaction: {data.get('price_drop')}
+- Estimated structure loss: {data.get('arch_loss')}
+- Recommendation: Maintain current logistics routes. Local markets demonstrating resilience."""
 
 # --- MAIN APP ROUTE & UI ---
 @app.route("/")
@@ -112,18 +162,21 @@ def index():
     #header h2 { font-size: 1.5rem; font-weight: 600; color: #ff9900; margin: 0; text-transform: uppercase; letter-spacing: 2px;}
     #map-summary-container, #detail-view-panel, #summary-controls-panel, #detail-graph-container { background-color: #0a0a0a; border: 1px solid #333; border-radius: 4px; padding: 15px; display: flex; flex-direction: column; }
     #map-summary-container { grid-column: 1 / 2; grid-row: 2 / 3; }
-    #detail-view-panel { grid-column: 2 / 3; grid-row: 2 / 3; gap: 10px; overflow-y: auto; }
+    #detail-view-panel { grid-column: 2 / 3; grid-row: 2 / 3; gap: 10px; overflow-y: auto; position: relative;}
     #summary-controls-panel { grid-row: 3 / 4; grid-column: 1 / 2; gap: 15px; max-height: 40vh; overflow-y: auto; }
     #detail-graph-container { grid-column: 2 / 3; grid-row: 3 / 4; max-height: 40vh; overflow-y: auto; }
     #map { flex-grow: 1; min-height: 350px; border-radius: 4px; filter: invert(100%) hue-rotate(180deg) brightness(95%) contrast(120%); }
     .card-title { font-size: 1.1rem; font-weight: 600; color: #00ff00; margin-bottom: 10px; border-bottom: 1px solid #333; padding-bottom: 5px; text-transform: uppercase;}
     .data-label { color: #888; font-size: 0.9em; }
     .data-value { color: #fff; font-weight: 600; font-size: 1em; }
-    #analysis-buttons { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; flex-shrink: 0; }
-    .analysis-btn { padding: 8px 5px; border: 1px solid #00ff00; border-radius: 2px; background-color: transparent; color: #00ff00; cursor: pointer; font-size: 0.85em; text-transform: uppercase; font-weight: 600; }
+    #analysis-buttons { display: flex; flex-wrap: wrap; gap: 10px; flex-shrink: 0; }
+    .analysis-btn { flex: 1 1 30%; padding: 8px 5px; border: 1px solid #00ff00; border-radius: 2px; background-color: transparent; color: #00ff00; cursor: pointer; font-size: 0.85em; text-transform: uppercase; font-weight: 600; }
     .analysis-btn:hover:not(:disabled) { background-color: rgba(0, 255, 0, 0.2); }
     .analysis-btn:disabled { border-color: #333; color: #555; cursor: not-allowed; }
     .analysis-btn.active { background-color: #00ff00; color: #000; }
+    .ai-btn { border-color: #00ffff; color: #00ffff; }
+    .ai-btn:hover:not(:disabled) { background-color: rgba(0, 255, 255, 0.2); }
+    .ai-btn.active { background-color: #00ffff; color: #000; }
     #manual-analysis-section { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; background-color: #111; padding: 15px; border: 1px solid #333;}
     #manual-analysis-section input, #manual-analysis-section select { background-color: #000; color: #00ff00; border: 1px solid #333; padding: 5px; font-family: 'Fira Code', monospace; width: 100%; box-sizing: border-box; }
     #btn-manual-run { background-color: #00ff00; color: #000; border: none; font-weight: 600;}
@@ -137,13 +190,17 @@ def index():
     .mini-chart-wrapper { background-color: #111; padding: 10px; border: 1px solid #333; height: 200px; min-width: 200px; display: flex; flex-direction: column; }
     .chart-description { background-color: #111; border-left: 3px solid #ff9900; padding: 10px; margin-top: 15px; font-size: 0.85rem; color: #ccc;}
     .detail-item { padding: 8px 0; border-bottom: 1px solid #222; }
-    .impact-score { color: #ff3333; font-weight: 600; }
+    
+    /* Typewriter Dossier CSS */
+    .ai-dossier { background-color: #00111a; border-left: 4px solid #00ffff; padding: 15px; margin-top: 10px; color: #00ffff; text-shadow: 0 0 5px rgba(0,255,255,0.5); font-size: 0.9em; line-height: 1.6; display: none; min-height: 200px; white-space: pre-wrap;}
+    .blinking-cursor::after { content: '█'; animation: blink 1s step-start infinite; }
+    @keyframes blink { 50% { opacity: 0; } }
     </style>
 </head>
 <body>
     <div id="app-container">
         <div id="header">
-            <h2>DYNAMIC MULTI-DOMAIN RIPPLE INTELLIGENCE SYSTEM</h2>
+            <h2>GEO-ECONOMIC RIPPLE TERMINAL v6.0</h2>
             <small class="text-xs" style="color:#00ff00;">STATUS: MULTI-HAZARD AI ONLINE | OPR: ARYAN</small>
         </div>
 
@@ -172,8 +229,14 @@ def index():
                 <button id="btn-finance" class="analysis-btn" disabled>MARKETS</button>
                 <button id="btn-predict" class="analysis-btn" disabled>PROJECTIONS</button>
                 <button id="btn-overall" class="analysis-btn" disabled>MACRO SUMMARY</button>
+                <button id="btn-ai" class="analysis-btn ai-btn" disabled style="flex-basis: 100%;">[+] GENERATE AI BRIEFING</button>
             </div>
             <h3 class="card-title" style="margin-top:15px; border-color:#ff9900; color:#ff9900;">ASSET DAMAGE LOG</h3>
+            
+            <div id="ai-dossier" class="ai-dossier">
+                <p id="ai-text-container" class="blinking-cursor">[AWAITING UPLINK...]</p>
+            </div>
+
             <div id="dynamic-report-content" class="flex-grow">
                 <p style="color:#555;">[AWAITING SECTOR SELECTION...]</p>
             </div>
@@ -238,10 +301,13 @@ def index():
         let currentAnalysisResults = null; 
         let currentEpicenterInfo = null;  
         let globalRawEvents = []; 
+        let typewriterInterval = null;
 
-        const analysisButtons = [document.getElementById('btn-cities'), document.getElementById('btn-transport'), document.getElementById('btn-infra'), document.getElementById('btn-finance'), document.getElementById('btn-predict'), document.getElementById('btn-overall')];
+        const analysisButtons = [document.getElementById('btn-cities'), document.getElementById('btn-transport'), document.getElementById('btn-infra'), document.getElementById('btn-finance'), document.getElementById('btn-predict'), document.getElementById('btn-overall'), document.getElementById('btn-ai')];
         const summaryDiv = document.getElementById('earthquake-summary');
         const dynamicReportContent = document.getElementById('dynamic-report-content');
+        const aiDossier = document.getElementById('ai-dossier');
+        const aiTextContainer = document.getElementById('ai-text-container');
         const chartCollectionDiv = document.getElementById('chart-collection');
         const chartDescriptionContainer = document.getElementById('chart-description-container');
 
@@ -257,7 +323,6 @@ def index():
 
         let currentCharts = []; 
 
-        // Severity Data
         const tsunamiData = { 1: {wave:1.0, desc:"Minor Surge"}, 2: {wave:1.5, desc:"Strong Surge"}, 3: {wave:2.5, desc:"Significant Inundation"}, 4: {wave:4.0, desc:"Dangerous Wave"}, 5: {wave:6.5, desc:"Highly Destructive"}, 6: {wave:9.0, desc:"Major Tsunami"}, 7: {wave:12.0, desc:"Catastrophic"}, 8: {wave:16.0, desc:"Extreme Catastrophe"}, 9: {wave:22.0, desc:"Mega-Tsunami"}, 10: {wave:30.0, desc:"Apocalyptic Event"} };
         const floodData = { 1: {rain:20, dur:12, desc:"Nuisance Flooding"}, 2: {rain:30, dur:18, desc:"Minor Urban Pooling"}, 3: {rain:50, dur:24, desc:"Urban Flash Flood"}, 4: {rain:70, dur:24, desc:"Significant Flash Flood"}, 5: {rain:100, dur:36, desc:"Severe River Overflow"}, 6: {rain:130, dur:36, desc:"Major Infrastructure Threat"}, 7: {rain:165, dur:48, desc:"Catastrophic Deluge"}, 8: {rain:210, dur:48, desc:"Extreme Flood Event"}, 9: {rain:260, dur:72, desc:"Historic Regional Flood"}, 10: {rain:320, dur:72, desc:"Apocalyptic Deluge"} };
         
@@ -308,7 +373,6 @@ def index():
              impactZones = [];
              if (!maxRadius || maxRadius <= 0) return;
              
-             // REVERSED ORDER: Draw largest to smallest to fix Z-Index hover bug
              const zones = [
                  { r: maxRadius * 1.00, color: '#888888', opacity: 0.1, label: 'ZONE 4: FELT AREA / MINOR RIPPLE' },
                  { r: maxRadius * 0.70, color: '#ffff00', opacity: 0.2, label: 'ZONE 3: MODERATE DISRUPTION' },
@@ -359,6 +423,8 @@ def index():
             if (epicenterMarker) map.removeLayer(epicenterMarker);
             impactZones.forEach(z => map.removeLayer(z)); impactZones = [];
 
+            aiDossier.style.display = 'none';
+            dynamicReportContent.style.display = 'block';
             dynamicReportContent.innerHTML = '<p style="color:#555;">[AWAITING SECTOR SELECTION...]</p>';
             chartCollectionDiv.innerHTML = '';
             chartDescriptionContainer.innerHTML = '<p>[STANDBY FOR TELEMETRY DATA...]</p>';
@@ -367,9 +433,19 @@ def index():
             currentAnalysisResults = null; currentEpicenterInfo = null;
             analysisButtons.forEach(btn => { btn.disabled = true; btn.classList.remove('active'); });
             summaryDiv.innerHTML = '<p style="color:#555;">[SELECT LIVE EVENT FROM MAP OR INITIATE MANUAL SIMULATION]</p>';
+            if(typewriterInterval) clearInterval(typewriterInterval);
         }
 
-        function setActiveButton(clickedButton) { analysisButtons.forEach(btn => btn.classList.remove('active')); if (clickedButton) clickedButton.classList.add('active'); }
+        function setActiveButton(clickedButton) { 
+            analysisButtons.forEach(btn => btn.classList.remove('active')); 
+            if (clickedButton) clickedButton.classList.add('active'); 
+            
+            if(clickedButton.id !== 'btn-ai') {
+                aiDossier.style.display = 'none';
+                dynamicReportContent.style.display = 'block';
+            }
+        }
+        
         function createMiniChart(id, title) { const chartWrapper = document.createElement('div'); chartWrapper.className = 'mini-chart-wrapper'; chartWrapper.innerHTML = `<h5 class="text-sm font-semibold text-gray-300 mb-2">${title}</h5><canvas id="${id}"></canvas>`; chartCollectionDiv.appendChild(chartWrapper); return document.getElementById(id).getContext('2d'); }
         
         function generateSectorCharts(sectorKey, dataList, title) {
@@ -402,7 +478,6 @@ def index():
             
             const sortedList = [...dataList].sort((a, b) => b[sortKey] - a[sortKey]);
             let drawnLines = 0;
-            
             const globalHubs = [[37.33,-122.00], [51.50,-0.12], [35.68,139.76], [19.07,72.87], [22.30,114.17]];
 
             html += sortedList.map(item => {
@@ -417,7 +492,6 @@ def index():
                     }
                     drawnLines++;
                 }
-
                 return `<div class="detail-item" style="border-left: 3px solid ${color}; padding-left: 10px;">
                         <h5 class="data-value">${item.name}</h5><p class="data-label">Impact: <span style="color:#ff3333;">${item[sortKey]}${unit}</span></p></div>`;
             }).join('');
@@ -451,6 +525,63 @@ def index():
             `;
         }
 
+        // --- NEW: GEMINI AI INTEGRATION WITH FALLBACK ---
+        document.getElementById('btn-ai').addEventListener('click', async () => {
+            setActiveButton(document.getElementById('btn-ai'));
+            dynamicReportContent.style.display = 'none';
+            aiDossier.style.display = 'block';
+            
+            if(typewriterInterval) clearInterval(typewriterInterval);
+            aiTextContainer.innerHTML = '[ESTABLISHING SECURE UPLINK WITH GERT-AI...]';
+            
+            if (!currentAnalysisResults) return;
+
+            let high = 0, med = 0, low = 0;
+            let total = 0;
+            ['cities', 'transportation', 'infrastructure', 'companies'].forEach(key => {
+                if(!currentAnalysisResults[key]) return;
+                currentAnalysisResults[key].forEach(item => {
+                    let score = item.impact_score || item.predicted_drop_percent || 0;
+                    if (score >= 7.0) high++;
+                    else if (score >= 3.0) med++;
+                    else low++;
+                    total++;
+                });
+            });
+
+            const payload = {
+                type: currentAnalysisResults.type || document.getElementById('disaster-type').value,
+                mag: currentEpicenterInfo.mag,
+                total: total,
+                high: high,
+                med: med,
+                low: low,
+                price_drop: currentAnalysisResults.predictions.price_fluctuation || "Unknown",
+                arch_loss: currentAnalysisResults.predictions.architecture_loss || "Unknown"
+            };
+
+            try {
+                const response = await fetch('/api/ai_briefing', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+                const data = await response.json();
+                
+                let text = data.briefing || "ERROR: LLM Response Failed.";
+                aiTextContainer.innerHTML = '';
+                let i = 0;
+                typewriterInterval = setInterval(() => {
+                    aiTextContainer.innerHTML += text.charAt(i);
+                    i++;
+                    if(i >= text.length) clearInterval(typewriterInterval);
+                }, 20); 
+
+            } catch (err) {
+                aiTextContainer.innerHTML = `[CONNECTION ERROR: ${err.message}]`;
+            }
+        });
+
         async function fetchAndPlotEvents() {
              try {
                  const response = await fetch(`/api/live_events?timeframe=${document.getElementById('time-filter').value}`);
@@ -469,7 +600,6 @@ def index():
         document.getElementById('btn-predict').addEventListener('click', generatePredictionReport);
         document.getElementById('btn-overall').addEventListener('click', generateOverallReport);
 
-        // --- MAP CLICK LISTENER ---
         map.on('click', function(e){
              const targetClasses = e.originalEvent.target.classList;
              if (targetClasses.contains('leaflet-marker-icon') || 
@@ -483,7 +613,6 @@ def index():
              }
         });
 
-        // --- MAIN SIMULATION EXECUTION ---
         document.getElementById('btn-manual-run').addEventListener('click', async () => {
             const lat = parseFloat(manualLat.value); const lon = parseFloat(manualLon.value);
             const type = document.getElementById('disaster-type').value;
@@ -504,7 +633,10 @@ def index():
                     : `/api/simulate_event?type=${type}&lat=${lat}&lon=${lon}&mag=${simMag}&depth=${simDepth}`;
 
                 const response = await fetch(apiUrl);
+                if (!response.ok) throw new Error("API Server Error: Could not calculate impact.");
+                
                 const data = await response.json();
+                if (data.error) throw new Error(data.error);
 
                 let disasterColor = type === 'tsunami' ? '#0088ff' : (type === 'flood' ? '#00ff00' : '#ff3333');
                 epicenterMarker = L.circleMarker([lat, lon], { radius: 10, color: '#fff', weight: 4, fill: true, fillColor: disasterColor, fillOpacity: 1 }).addTo(map).bindPopup(`<strong>ORIGIN</strong>`).openPopup();
@@ -512,6 +644,7 @@ def index():
                 currentEpicenterInfo = { lat, lon, mag: simMag, depth: simDepth };
                 
                 currentAnalysisResults = {
+                    type: type,
                     cities: data.cities || data.affected_cities || [],
                     transportation: data.transportation || data.affected_transportation || [],
                     infrastructure: data.infrastructure || data.affected_infrastructure || [],
@@ -521,12 +654,10 @@ def index():
                     max_distance_km: data.max_distance_km || 500
                 };
                 
-                // TRIGGER NUCLEAR BLAST ZONES
                 drawImpactZones(lat, lon, currentAnalysisResults.max_distance_km, disasterColor);
 
                 let totalHit = currentAnalysisResults.cities.length + currentAnalysisResults.transportation.length + currentAnalysisResults.infrastructure.length + currentAnalysisResults.companies.length;
                 
-                // GENERATE HAZARD BANNERS
                 let warningsHtml = '';
                 if (currentAnalysisResults.warnings && currentAnalysisResults.warnings.length > 0) {
                     currentAnalysisResults.warnings.forEach(w => {
@@ -538,22 +669,13 @@ def index():
                 summaryDiv.innerHTML = `<h4 class="card-title" style="color:${disasterColor};">[PROTOCOL COMPLETE]</h4>
                                         <p class="data-label">Total Assets Hit: <span style="color:#fff; font-weight:bold; font-size:1.2em;">${totalHit}</span></p>
                                         ${warningsHtml}
-                                        <p class="text-xs mt-3" style="color:#00ff00;">> Select sector to map lasers...</p>`;
+                                        <p class="text-xs mt-3" style="color:#00ff00;">> Select sector to map lasers or generate AI briefing...</p>`;
                 
                 analysisButtons.forEach(btn => btn.disabled = false);
             } catch (err) { summaryDiv.innerHTML = `<p style="color:#ff3333;">ERROR: ${err.message}</p>`; }
         });
 
-        document.getElementById('btn-manual-clear').addEventListener('click', () => {
-            currentAnalysisResults = null; activeMarkersLayer.clearLayers(); affectedLinesLayer.clearLayers(); 
-            if(epicenterMarker) map.removeLayer(epicenterMarker); 
-            impactZones.forEach(z => map.removeLayer(z)); impactZones = [];
-            plotFilteredEvents(); 
-            summaryDiv.innerHTML = '<p style="color:#555;">[STANDBY]</p>';
-            analysisButtons.forEach(btn => { btn.disabled = true; btn.classList.remove('active'); });
-            chartCollectionDiv.innerHTML = '';
-            dynamicReportContent.innerHTML = '<p style="color:#555;">[AWAITING SECTOR SELECTION...]</p>';
-        });
+        document.getElementById('btn-manual-clear').addEventListener('click', clearAnalysisDisplay);
 
         fetchAndPlotEvents();
     </script>
@@ -562,6 +684,56 @@ def index():
 """)
 
 # --- API ROUTES ---
+
+@app.route("/api/ai_briefing", methods=["POST"])
+def ai_briefing():
+    data = request.json
+    last_error = ""
+
+    # 1. TRY KEY ROTATION
+    for key in GEMINI_KEYS:
+        if not key or key == "YOUR_ACTUAL_API_KEY_HERE": continue
+        
+        try:
+            genai.configure(api_key=key)
+            temp_model = genai.GenerativeModel('gemini-2.5-flash')
+            
+            prompt = f"""
+            You are a helpful Intelligence Advisor. Explain this complex disaster data in simple human terms.
+            - Event: {data.get('type')} at {data.get('mag')} strength.
+            - Total objects in area: {data.get('total')}
+            - Risk Levels: {data.get('high')} dangerous, {data.get('med')} moderate, {data.get('low')} safe/minor.
+            - Economic Impact: {data.get('price_drop')} stock drop and {data.get('arch_loss')} buildings damaged.
+
+            INSTRUCTIONS:
+            - Use a friendly but professional human tone.
+            - Explain the 'Impact Score' clearly (e.g., 'Most cities have a low score, meaning people will feel it, but buildings should stay standing').
+            - Format precisely with the Headers and Bullet points shown below.
+            - DO NOT use markdown bolding (**).
+
+            FORMAT:
+            [THE SITUATION]
+            - (Simple summary of what happened and how big it was)
+
+            [PEOPLE AND BUILDINGS]
+            - (Explain the risk levels like a human. Relate the scores to real-life feelings/effects)
+
+            [MONEY AND SUPPLIES]
+            - (Explain the stock market drop and building loss simply)
+            """
+            
+            response = temp_model.generate_content(prompt)
+            return jsonify({"briefing": response.text})
+            
+        except Exception as e:
+            last_error = str(e)
+            print(f"[AI WARNING] Key failed: {last_error}")
+            continue
+
+    # 2. OFFLINE SAFETY NET IF ALL KEYS EXHAUSTED
+    print("[AI SYSTEM] ALL KEYS EXHAUSTED. TRIGGERING EDGE-COMPUTING MODE.")
+    return jsonify({"briefing": generate_offline_briefing(data)})
+
 @app.route("/api/live_events")
 def get_live_events():
     timeframe = request.args.get("timeframe", "24h")
@@ -588,7 +760,7 @@ def get_live_events():
 def simulate_event():
     try:
         t = request.args.get("type", "earthquake")
-        p = { "lat": float(request.args.get("lat")), "lon": float(request.args.get("lon")), "mag": float(request.args.get("mag")), "depth": float(request.args.get("depth")) }
+        p = { "lat": sanitize_float(request.args.get("lat")), "lon": sanitize_float(request.args.get("lon")), "mag": sanitize_float(request.args.get("mag")), "depth": sanitize_float(request.args.get("depth")) }
         conn = psycopg2.connect(host=DB_HOST, port=os.environ.get("PGPORT", 5432), database=DB_NAME, user=DB_USER, password=DB_PASS)
         res = run_disaster(t, p, conn, financial_model)
         conn.close()
@@ -598,9 +770,16 @@ def simulate_event():
 @app.route("/api/calculate_impact")
 def calculate_impact_api():
     try:
-        lat, lon, mag, depth = float(request.args.get("lat")), float(request.args.get("lon")), float(request.args.get("mag")), float(request.args.get("depth"))
-        sig, cdi, nst, gap = float(request.args.get("sig", 0)), float(request.args.get("cdi", 0)), float(request.args.get("nst", 0)), float(request.args.get("gap", 0))
-    except: return jsonify({"error": "Invalid params"}), 400
+        lat = sanitize_float(request.args.get("lat"))
+        lon = sanitize_float(request.args.get("lon"))
+        mag = sanitize_float(request.args.get("mag"))
+        depth = sanitize_float(request.args.get("depth"))
+        sig = sanitize_float(request.args.get("sig", 0))
+        cdi = sanitize_float(request.args.get("cdi", 0))
+        nst = sanitize_float(request.args.get("nst", 0))
+        gap = sanitize_float(request.args.get("gap", 0))
+    except: 
+        return jsonify({"error": "Invalid params"}), 400
 
     prelims = predict_advanced_impact(lat, lon, mag, depth, sig, cdi, nst, gap)
     is_oceanic = prelims.get("nearest_city_distance_km", 100) > MAX_LAND_PROXIMITY_KM

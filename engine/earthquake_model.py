@@ -9,8 +9,23 @@ try:
 except:
     ai_active = False
 
+# --- THE DATA SANITIZER ---
+def sanitize_float(val, default=0.0):
+    try:
+        if val is None: return default
+        v = float(val)
+        if math.isnan(v) or math.isinf(v): return default
+        return v
+    except:
+        return default
+
 def run_earthquake(params, db_conn, financial_model=None):
-    lat, lon, mag, depth = params["lat"], params["lon"], params["mag"], params["depth"]
+    # Sanitize all incoming API data
+    lat = sanitize_float(params.get("lat"))
+    lon = sanitize_float(params.get("lon"))
+    mag = sanitize_float(params.get("mag"), 5.0)
+    depth = sanitize_float(params.get("depth"), 10.0)
+    
     cur = db_conn.cursor()
     affected = {"cities": [], "transportation": [], "infrastructure": [], "companies": []}
     
@@ -33,13 +48,15 @@ def run_earthquake(params, db_conn, financial_model=None):
             cur.execute(f"SELECT name, ST_Y(geo::geometry), ST_X(geo::geometry), ST_Distance(geo, '{epicenter_geom}') / 1000 FROM {table} WHERE ST_DWithin(geo, '{epicenter_geom}', {radius})")
             for name, t_lat, t_lon, dist in cur.fetchall():
                 
-                # SCIENTIFIC DECAY FALLBACK
+                dist = sanitize_float(dist)
+                
                 if ai_active:
                     impact = rf_model.predict([[mag, dist, default_vuln]])[0]
                 else:
-                    impact = mag - (2.1 * math.log10(dist + 1)) + (10 / max(1, depth))
+                    impact = mag - (2.1 * math.log10(dist + 1)) + (10 / max(1.0, depth))
                 
-                impact = max(0, min(10, impact + random.uniform(-0.04, 0.04))) # Cap at 10
+                impact = sanitize_float(impact)
+                impact = max(0.0, min(10.0, impact + random.uniform(-0.04, 0.04))) 
                 
                 if impact > 0.2: 
                     item = {"name": name, "lat": t_lat, "lon": t_lon, "distance": round(dist, 1), "impact_score": round(impact, 2), "type": "Seismic Asset"}
@@ -59,11 +76,13 @@ def run_earthquake(params, db_conn, financial_model=None):
     finally: cur.close()
 
     if max_physical_distance_km == 0: max_physical_distance_km = query_radius_m / 1000.0
-    macro_recovery_years = xgb_model.predict([[mag, max_physical_distance_km, 8.0]])[0] if ai_active else mag / 2
+    
+    macro_recovery_years = xgb_model.predict([[mag, max_physical_distance_km, 8.0]])[0] if ai_active else mag / 2.0
+    macro_recovery_years = sanitize_float(macro_recovery_years, 0.5)
 
-    # REALISTIC PROJECTIONS TIED TO TOTAL IMPACT
-    base_price_drop = min(65.0, (total_impact / 1000.0) * 1.8) # Huge impact = Huge Drop
+    base_price_drop = min(65.0, (total_impact / 1000.0) * 1.8) 
     base_arch_loss = int(total_impact * 25)
+    city_score = sanitize_float(total_impact / max(1, len(affected["cities"])))
 
     affected["type"] = "earthquake"
     affected["max_distance_km"] = round(max_physical_distance_km, 1) 
@@ -73,6 +92,6 @@ def run_earthquake(params, db_conn, financial_model=None):
         "homelessness_rate": f"{round((total_impact / max(1, total_assets_hit)) * 2.5, 2)}%", 
         "architecture_loss": f"{base_arch_loss:,} critical structures", 
         "recovery_rate": f"{round(macro_recovery_years, 1)} years", 
-        "city_impact_score": round(total_impact / max(1, len(affected["cities"])), 2) 
+        "city_impact_score": round(city_score, 2) 
     }
     return affected
